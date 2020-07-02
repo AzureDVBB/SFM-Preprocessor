@@ -13,15 +13,14 @@ from typing import List, Optional, Iterable, Union
 import timeit
 import warnings
 import math
+import multiprocessing as mp
 
 # installed library
-from dask import compute
-import matplotlib.pyplot as plt
 
 # local library
-from io_module import test_video_length, read_video
-from analysis_module import (image_descriptors, laplace_sharpness_estimate,
-                             base_match_descriptors_parallel)
+from using_skimage.io_module import test_video_length, read_video
+from using_skimage.analysis_module import (image_descriptors, laplace_sharpness_estimate,
+                                           base_match_descriptors_parallel)
 
 
 def plot_results(similarity_estimate: Iterable[Union[float, int]],
@@ -62,6 +61,7 @@ def plot_results(similarity_estimate: Iterable[Union[float, int]],
     None
 
     """
+    import matplotlib.pyplot as plt
 
     indexes = list(range(index_start, index_start + len(goodness_estimate)))
     norm_goodness = [i * (1/max(goodness_estimate)) for i in goodness_estimate]
@@ -201,12 +201,14 @@ def normalized_mse_select(similarity_estimate: Iterable[Union[float, int]],
 
 
 
-def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, chunk_size: int = 25,
+def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, buffer_size: int = 25,
                     min_distance: int = 5, max_distance: int = 60, image_count: Optional[int] = None,
                     start_index: int = 0, end_index: Optional[int] = None,
                     similarity_percentile: float = 0.2, sharpness_percentile: float = 0.15,
-                    debug_msg: bool = True, debug_plots: bool = False) -> List[int]:
+                    debug_msg: bool = True, debug_plots: bool = False,
+                    as_generator: bool = False) -> List[int]:
     """
+    TODO: make awesome description
 
     Parameters
     ----------
@@ -218,7 +220,7 @@ def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, c
     max_keypoints : int, optional
         Maximum number of keypoint descriptors per video frame (image).
         The default is 1000
-    chunk_size : int, optional
+    buffer_size : int, optional
         Number of video frames (images) to load into memory at once before they are analyzed.
         LOWERing this will mean LESS RAM being used. Try to keep it at n_workers*2 for
         optimal speed.
@@ -258,16 +260,25 @@ def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, c
         the 'goodness' estimate of each video frame (image) and the picked index.
         Useful for developing new selection functions and evaluating them.
         The default is False
+    as_generator : bool, optional
+        Behave like a generator instead of a function, returning the index of each new selected
+        frame, raising StopIteration when the function terminates.
 
     Raises
     ------
     StopIteration
         Premature end of video file. Program will continue to run and not fail.
+        Will also raise it if as_generator is set True, as it will behave as a slow.. generator.
 
     Returns
     -------
     List[int]
         List of (integer) indexes where the function has selected 'good' video frames (images).
+
+    Yields
+    -------
+    int
+        Selected frame index.
 
     """
 
@@ -276,7 +287,7 @@ def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, c
         assert start_index < end_index, "start index is greater then the end index"
     assert min_distance < max_distance, "min distance greater then max distance"
 
-    if chunk_size <= n_workers*2:
+    if buffer_size <= n_workers*2:
         warnings.warn(f"Chunk size is less then twice the worker process count. "
                       f"Performace will suffer.")
 
@@ -304,7 +315,7 @@ def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, c
 
     reader_end = False
 
-    reader = read_video(fpath, dask_array=True)
+    reader = read_video(fpath, as_gray=True)
     reader_index = 0
     if debug_msg:
         print(f'**** Seeking to start index [{start_index}]')
@@ -325,95 +336,97 @@ def video_selection(fpath: str, n_workers: int = 2, max_keypoints: int = 1000, c
     sharp_buffer = []
     selected_indexes = []
 
+
     # run untill out of frames or at end index
-    while not reader_end:
+    with mp.Pool(n_workers) as pool: # start pool context manager
+        while not reader_end:
 
-        if debug_msg:
-            print(f'>><< Starting to fill image buffer with a maximum of [{chunk_size}] images')
-            tmp_start_time = timeit.default_timer()
-        # try and fill Frame buffer from video
-        while len(img_buffer) < chunk_size and (len(img_buffer) + len(desc_buffer) <
-                                                max_distance - min_distance):
-            try:
-                if reader_index <= base_index + min_distance:
-                    next(reader)
-                else:
-                    img_buffer.append(next(reader))
-                reader_index += 1
-                if end_index is not None and reader_index >= end_index:
-                    raise StopIteration
-            except StopIteration:
-                reader_end = True
-                break
-            except:
-                raise
-
-        if debug_msg:
-            print(f'<<>> Buffered [{len(img_buffer)}] images in '
-                  f'({round(timeit.default_timer() - tmp_start_time, 3)} s)')
-            print(f'++++ Starting keypoint descriptor extraction and sharpness estimation of '
-                  f'[{len(img_buffer)}] images in buffer')
-            tmp_start_time = timeit.default_timer()
-
-        # calculate sharpness and descriptors for the buffer images with dask, purge buffer
-        desc = [image_descriptors(img, max_keypoints, delay=True) for img in img_buffer]
-        sharp = [laplace_sharpness_estimate(img, delay=True) for img in img_buffer]
-
-        del img_buffer
-        img_buffer = []
-
-        desc = compute(desc, scheduler='processes', num_workers=n_workers)[0]
-        desc_buffer.extend(desc)
-        del desc
-
-        sharp = compute(sharp, scheduler='processes', num_workers=n_workers)[0]
-        sharp_buffer.extend(sharp)
-        del sharp
-
-        if debug_msg:
-            print(f'---- Finished extraction, sharpness estimate and purged image buffer in'
-                  f' ({round(timeit.default_timer() - tmp_start_time, 3)} s)')
-
-        if len(desc_buffer) >= max_distance - min_distance or reader_end:
             if debug_msg:
-                print(f'>>>> Selecting best fit from [{len(desc_buffer)}] images '
-                      f'with base index [{base_index}]')
+                print(f'>><< Starting to fill image buffer with a maximum of [{buffer_size}] images')
                 tmp_start_time = timeit.default_timer()
-                print(f"++++ Matching [{len(desc_buffer)}] image's descriptors to base...")
+            # try and fill Frame buffer from video
+            while len(img_buffer) < buffer_size and (len(img_buffer) + len(desc_buffer) <
+                                                    max_distance - min_distance):
+                try:
+                    if reader_index <= base_index + min_distance:
+                        next(reader)
+                    else:
+                        img_buffer.append(next(reader))
+                    reader_index += 1
+                    if end_index is not None and reader_index >= end_index:
+                        raise StopIteration
+                except StopIteration:
+                    reader_end = True
+                    break
 
-            # calculate similarity to base image
-            matches = base_match_descriptors_parallel(base_descriptor, desc_buffer,
-                                                      workers=n_workers)
             if debug_msg:
-                print(f'---- Matching finished in '
+                print(f'<<>> Buffered [{len(img_buffer)}] images in '
                       f'({round(timeit.default_timer() - tmp_start_time, 3)} s)')
+                print(f'++++ Starting keypoint descriptor extraction and sharpness estimation of '
+                      f'[{len(img_buffer)}] images in buffer')
+                tmp_start_time = timeit.default_timer()
 
-            # select best fit index
-            selected_idx_rel = normalized_mse_select(matches, sharp_buffer,
-                                                     debug_plotting=debug_msg,
-                                                     debug_plot_index_start=base_index)
-            selected_idx = selected_idx_rel + base_index + min_distance
+            # calculate sharpness and descriptors for the buffer images, purge buffer
+            desc = pool.starmap(image_descriptors, [[img, max_keypoints,] for img in img_buffer])
+            sharp = pool.starmap(laplace_sharpness_estimate, [[img,] for img in img_buffer])
+
+            del img_buffer
+            img_buffer = []
+
+            desc_buffer.extend(desc)
+            del desc
+
+            sharp_buffer.extend(sharp)
+            del sharp
+
             if debug_msg:
-                print(f'<<<< Found best fit image at index [{selected_idx}] of '
-                      f'[{image_count if end_index is None else end_index}] total images')
-            selected_indexes.append(selected_idx)
+                print(f'---- Finished extraction, sharpness estimate and purged image buffer in'
+                      f' ({round(timeit.default_timer() - tmp_start_time, 3)} s)')
 
-            # set new base, remove unneeded data (sharpness and descriptors bellow base index)
-            base_index = selected_idx
-            base_descriptor = desc_buffer[selected_idx_rel]
+            if len(desc_buffer) >= max_distance - min_distance or reader_end:
+                if debug_msg:
+                    print(f'>>>> Selecting best fit from [{len(desc_buffer)}] images '
+                          f'with base index [{base_index}]')
+                    tmp_start_time = timeit.default_timer()
+                    print(f"++++ Matching [{len(desc_buffer)}] image's descriptors to base...")
 
-            deletion_end = selected_idx_rel + 1 + min_distance
-            deletion_end = deletion_end if deletion_end <= len(desc_buffer) else len(desc_buffer)
-            del matches
-            del desc_buffer[:deletion_end]
-            del sharp_buffer[:deletion_end]
+                # calculate similarity to base image
+                matches = base_match_descriptors_parallel(base_descriptor, desc_buffer,
+                                                          workers=n_workers)
+                if debug_msg:
+                    print(f'---- Matching finished in '
+                          f'({round(timeit.default_timer() - tmp_start_time, 3)} s)')
 
-        elif debug_msg:
-            print(f'<><> [{len(desc_buffer)}/{max_distance - min_distance}] '
-                  f'images ready for selection, continuing....')
+                # select best fit index
+                selected_idx_rel = normalized_mse_select(matches, sharp_buffer,
+                                                         debug_plotting=debug_plots,
+                                                         debug_plot_index_start=base_index,
+                                                         similarity_avg_percent=similarity_percentile,
+                                                         sharpness_avg_percent=sharpness_percentile)
+                selected_idx = selected_idx_rel + base_index + min_distance
+                if debug_msg:
+                    print(f'<<<< Found best fit image at index [{selected_idx}] of '
+                          f'[{image_count if end_index is None else end_index}] total images')
+                selected_indexes.append(selected_idx)
+                if as_generator:
+                    yield selected_idx
+
+                # set new base, remove unneeded data (sharpness and descriptors bellow base index)
+                base_index = selected_idx
+                base_descriptor = desc_buffer[selected_idx_rel]
+
+                deletion_end = selected_idx_rel + 1 + min_distance
+                deletion_end = deletion_end if deletion_end <= len(desc_buffer) else len(desc_buffer)
+                del matches
+                del desc_buffer[:deletion_end]
+                del sharp_buffer[:deletion_end]
+
+            elif debug_msg:
+                print(f'<><> [{len(desc_buffer)}/{max_distance - min_distance}] '
+                      f'images ready for selection, continuing....')
 
     if debug_msg:
         print(f'!!!! End of file, successfully picked {len(selected_indexes)} images'
               f' out of [{image_count}] in ({round(timeit.default_timer() - start_time, 3)} s)')
-
-    return selected_indexes
+    if not as_generator:
+        return selected_indexes

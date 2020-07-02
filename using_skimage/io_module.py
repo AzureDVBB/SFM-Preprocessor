@@ -18,13 +18,11 @@ import timeit
 
 # installed library
 from skimage.io import imread, imread_collection as read_collection, imsave, ImageCollection
-from dask import array as da
 import imageio
 from numpy import ndarray
+import numpy as np
 
-
-
-def read_image(fpath: str, as_gray: bool = False, dask_array: bool = False) -> ndarray:
+def read_image(fpath: str, as_gray: bool = False) -> ndarray:
     """
     Reads an image from disk into memory and returns it.
 
@@ -35,9 +33,6 @@ def read_image(fpath: str, as_gray: bool = False, dask_array: bool = False) -> n
     as_gray : bool, optional
         Load image as grayscale (luminance only).
         The default is False
-    dask_array : bool, optional
-        Return the loaded image as a dask array, instead of a numpy array.
-        The default is False
 
     Returns
     -------
@@ -45,9 +40,6 @@ def read_image(fpath: str, as_gray: bool = False, dask_array: bool = False) -> n
         Array of the image loaded into memory.
 
     """
-
-    if dask_array:
-        return da.from_array(imread(fpath, as_gray))
     return imread(fpath, as_gray)
 
 
@@ -141,7 +133,7 @@ def save_image(image: ndarray, fpath: str, fname: str, overwrite: bool = True) -
 
 
 def read_video(fpath: str, uint16: bool = False,
-               dask_array: bool = False) -> Generator[ndarray, None, None]:
+               as_gray:bool = False) -> Generator[ndarray, None, None]:
     """
     Reads a video file and returns a generator object to load each video frame into memory lazily.
 
@@ -152,8 +144,9 @@ def read_video(fpath: str, uint16: bool = False,
     uint16 : bool, optional
         Request video frames to be loaded in as uint16 array instead of uint8 if able.
         The default is False
-    dask_array : bool, optional
-        Return dask array object instead of a numpy array.
+    as_gray : bool, optional
+        TODO: implement
+        Return image arrays as grayscale
         The default is False
 
     Yields
@@ -165,10 +158,7 @@ def read_video(fpath: str, uint16: bool = False,
 
     reader = imageio.get_reader(fpath, 'ffmpeg', dtype='uint16' if uint16 else 'uint8')
     for frame in reader:
-        if dask_array:
-            yield da.from_array(frame)
-        else:
-            yield frame
+        yield frame
 
 
 def test_video_length(fpath: str, accurate: bool = True, debug: bool = True) -> int:
@@ -209,7 +199,7 @@ def test_video_length(fpath: str, accurate: bool = True, debug: bool = True) -> 
 
 def save_video_frames(fpath: str, output_folder_path: str, frame_indexes: List[int],
                       debug_msg: bool = True, overwrite: bool = False,
-                      padding_zeros: bool = True) -> None:
+                      padding_zeros: bool = True, as_generator: bool = False) -> None:
     """
     Saves select frames of a video file by index onto disk.
 
@@ -230,10 +220,16 @@ def save_video_frames(fpath: str, output_folder_path: str, frame_indexes: List[i
     padding_zeros : bool, optional
         Pad out the file name beginning with 0's or just use indexes as names.
         The default is True
+    as_generator : bool, optional
+        Return the index of frame written, behaving like a generator.
+        The default is False
 
     Returns
     -------
     None.
+
+    int
+        last written frame index. ONLY IF as_generator = True
 
     """
 
@@ -249,7 +245,10 @@ def save_video_frames(fpath: str, output_folder_path: str, frame_indexes: List[i
                 temp_start_time = timeit.default_timer()
 
             name = str(curr_index).zfill(len(str(max_index))) if padding_zeros else str(curr_index)
-            save_image(frame, output_folder_path, name, overwrite)
+            try:
+                save_image(frame, output_folder_path, name, overwrite)
+            except FileExistsError:
+                print(f"!!!! '{name}.png' allready exists, skipping...")
 
             if debug_msg:
                 timed = str(round(timeit.default_timer() - temp_start_time, 3))
@@ -257,6 +256,8 @@ def save_video_frames(fpath: str, output_folder_path: str, frame_indexes: List[i
                     timed += "0"
                 print(f'><>< Finished saving "{name}.png" in ({timed}s) '
                       f' ...  [{frame_indexes.index(curr_index) + 1} / {len(frame_indexes)}] done')
+            if as_generator:
+                yield curr_index
 
         curr_index += 1
         if curr_index > max_index:

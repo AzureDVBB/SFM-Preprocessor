@@ -11,14 +11,13 @@ A collection of functions to analyze image data.
 # standard library
 from typing import Union, List, Iterable
 import warnings
+import multiprocessing as mp
 
 # installed library
 from skimage.feature import ORB, match_descriptors as match, canny
 from skimage.color import rgb2gray
 from skimage.metrics import structural_similarity as ssim
 from skimage.filters import laplace, gaussian
-from dask import delayed, compute
-from dask.delayed import Delayed # for typing only
 from numpy import ndarray # for typing only
 import numpy as np
 
@@ -63,7 +62,12 @@ def test_image_grayness(image: ndarray) -> bool:
 
     """
 
-    return bool(np.shape(image)[2] == 1)
+    if len(np.shape(image)) < 3:
+        return True
+    elif np.shape(image)[2] == 1:
+        return True
+    else:
+        return False
 
 
 def gray(image: ndarray) -> ndarray:
@@ -97,8 +101,7 @@ def gray(image: ndarray) -> ndarray:
                         "This only supports rgb conversion.")
 
 
-def image_descriptors(image: ndarray, num_keypoints: int = 500,
-                      delay: bool = False) -> Union[ndarray, Delayed]:
+def image_descriptors(image: ndarray, num_keypoints: int = 500) -> ndarray:
     """
     Calculates and image's keypoint descriptors.
 
@@ -109,28 +112,20 @@ def image_descriptors(image: ndarray, num_keypoints: int = 500,
     num_keypoints : int, optional
         Maximum number of keypoints and descriptors to calculate.
         The default is 500
-    delay : bool, optional
-        If set will returned a Dask Delayed object of the computation.
-        The default is False
 
     Returns
     -------
-    Union[ndarray, Delayed]
+    ndarray
         Image keypoint descriptors.
 
     """
-
-    if delay:
-        orb = ORB(n_keypoints=num_keypoints)
-        orb.detect_and_extract(gray(image))
-        return orb.descriptors
 
     orb = ORB(n_keypoints=num_keypoints)
     orb.detect_and_extract(gray(image))
     return orb.descriptors
 
 
-def match_descriptors(desc1: ndarray, desc2: ndarray, delay: bool = False) -> Union[int, Delayed]:
+def match_descriptors(desc1: ndarray, desc2: ndarray) -> int:
 
     """
     Matches two image descriptors and returns the number of matches.
@@ -141,25 +136,17 @@ def match_descriptors(desc1: ndarray, desc2: ndarray, delay: bool = False) -> Un
         Image keypoint descriptors.
     desc2 : ndarray
         Image keypoint descriptors.
-    delay : bool, optional
-        Wrap the function into dask Delayed object for later computation.
-        The defailt is False
 
     Returns
     -------
-    Union[int, Delayed]
+    int
         Number of matches between the two image keypoint descriptors.
 
     """
-
-    if delay:
-        return delayed(len)(delayed(match)(desc1, desc2))
-    else:
-        return len(match(desc1, desc2))
+    return len(match(desc1, desc2))
 
 
-def match_images(image1: ndarray, image2: ndarray,
-                 max_keypoints: int = 500, delay: bool = False) -> Union[int, Delayed]:
+def match_images(image1: ndarray, image2: ndarray, max_keypoints: int = 500) -> int:
     """
     Extracts and matches two images' keypoint descriptors, returning the number of matches.
 
@@ -172,9 +159,6 @@ def match_images(image1: ndarray, image2: ndarray,
     max_keypoints : int, optional
         Maximum number of image keypoints to use.
         The default is 500
-    delay : bool, optional
-        Wrap the internal computation into a dask Delayed object for later computation.
-        The default is False
 
     Returns
     -------
@@ -182,17 +166,10 @@ def match_images(image1: ndarray, image2: ndarray,
         Number of keypoint descriptor matches.
 
     """
-    if delay:
-        desc1 = delayed(image_descriptors)(image1, max_keypoints)
-        desc2 = delayed(image_descriptors)(image2, max_keypoints)
-        matches = delayed(match_descriptors)(desc1, desc2)
-        return delayed(len)(matches)
-
-    else:
-        desc1 = image_descriptors(image1, max_keypoints)
-        desc2 = image_descriptors(image2, max_keypoints)
-        matches = match_descriptors(desc1, desc2)
-        return len(matches)
+    desc1 = image_descriptors(image1, max_keypoints)
+    desc2 = image_descriptors(image2, max_keypoints)
+    matches = match_descriptors(desc1, desc2)
+    return matches
 
 
 def ssim_images(image1: ndarray, image2: ndarray) -> float:
@@ -295,9 +272,9 @@ def base_match_descriptors_parallel(base_desc: ndarray, descriptors: Iterable[nd
         Keypoint descriptor matches number.
 
     """
-
-    matches_delayed = [match_descriptors(base_desc, desc, delay=True) for desc in descriptors]
-    return compute(matches_delayed, scheduler='processes', num_workers=workers)[0]
+    with mp.Pool(workers) as pool:
+        results = pool.starmap(match_descriptors, [[base_desc, desc,] for desc in descriptors])
+    return results
 
 
 def pivot_match_images_parallel(images: Iterable[ndarray], pivot_index: int = 0,
@@ -327,14 +304,11 @@ def pivot_match_images_parallel(images: Iterable[ndarray], pivot_index: int = 0,
 
     """
 
-    matches = []
     base = images[pivot_index]
-    for i, img in enumerate(images):
-        if i != pivot_index:
-            matches.append(match_images(base, img, max_keypoints, delay=True))
-        else:
-            matches.append(None)
-    return compute(matches, scheduler='processes', num_workers=workers)[0]
+    with mp.Pool(workers) as pool:
+        results = pool.starmap(match_images, [([base, img, max_keypoints,] if i != pivot_index else None)
+                                              for i, img in enumerate(images)].remove(None))
+    return results.insert(None, pivot_index)
 
 
 def pivot_match_images(images: Iterable[ndarray], pivot_index: int = 0,
@@ -403,18 +377,14 @@ def pivot_structural_similarity_parallel(images: Iterable[ndarray], pivot_index:
         images = [gray(i) for i in images]
         is_gray = True
 
-    sim = []
-    base = images[pivot_index]
-    for i, img in enumerate(images):
-        if i != pivot_index:
-            sim.append(delayed(ssim)(base, img, multichannel=not is_gray))
-        else:
-            sim.append(None)
-
-    return compute(sim, scheduler='processes', num_workers=workers)[0]
+    with mp.Pool(workers) as pool:
+        base = images[pivot_index]
+        results = pool.starmap(ssim_images, [([base, img,] if i != pivot_index else None)
+                                             for i, img in enumerate(images)].remove(None))
+    return results.append(None, pivot_index)
 
 
-def laplace_sharpness_estimate(image: ndarray, delay: bool = False) -> Union[float, Delayed]:
+def laplace_sharpness_estimate(image: ndarray) -> float:
     """
     Runs a laplacian filter on the input image (edge detector) and returns its variance.
     This is used to estimate sharpness. (higher is sharper)
@@ -437,10 +407,7 @@ def laplace_sharpness_estimate(image: ndarray, delay: bool = False) -> Union[flo
     # There is an article using Support-Vector-Machine using both variance
     # and maxximum of the laplacian, might be worth looking into
 
-    if not delay:
-        return laplace(gray(image)).var()
-    elif delay:
-        return laplace(delayed(gray)(image)).var()
+    return laplace(gray(image)).var()
 
 
 def canny_sharpness_estimate(image: ndarray) -> float:
